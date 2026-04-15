@@ -8,6 +8,7 @@ import {
 } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { DataTable } from "./data-table";
+import { Disclaimer } from "./disclaimer";
 
 interface ApiResultData {
   apiId: number;
@@ -65,6 +66,7 @@ export function GeospatialCard({ result }: { result: ApiResultData }) {
         {result.data && result.data.length > 0 && (
           <DataTable data={result.data} />
         )}
+        <Disclaimer type="data" />
       </CardContent>
     </Card>
   );
