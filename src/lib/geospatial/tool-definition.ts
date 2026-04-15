@@ -1,10 +1,19 @@
 import { tool } from "ai";
 import { z } from "zod";
 import { geocode, reverseGeocode } from "./geocoder";
-import { fetchMultipleApis } from "./api-client";
+import { fetchMultipleApis, fetchGeospatialData } from "./api-client";
 import { buildMapUrl } from "./map-url";
 import { getAllApiConfigs } from "./api-registry";
 import { isMockModeEnabled } from "@/lib/mock/mock-responses";
+import {
+  calculateBuilding,
+  suggestStructure,
+  parseZoningData,
+} from "@/lib/simulation/building-calc";
+import { estimateRent } from "@/lib/simulation/rent-estimator";
+import { calculateRevenue } from "@/lib/simulation/revenue-calculator";
+import { getAreaBenchmark } from "@/lib/simulation/area-benchmarks";
+import type { BuildingStructure } from "@/types/simulation";
 
 const apiListDescription = getAllApiConfigs()
   .map((api) => `${api.id}: ${api.name} - ${api.description}`)
@@ -73,6 +82,154 @@ ${apiListDescription}
         })),
         mapUrl,
         mockMode: isMockModeEnabled(),
+      };
+    },
+  }),
+
+  simulate_investment: tool({
+    description: `指定した土地の収益シミュレーションを実行します。
+用途地域・地価データを自動取得し、建築可能規模・想定賃料・利回り・キャッシュフローを算出します。
+投資判断や土地活用提案に使用してください。`,
+    inputSchema: z.object({
+      lat: z.number().describe("緯度"),
+      lon: z.number().describe("経度"),
+      siteArea: z.number().describe("敷地面積（㎡）"),
+      structure: z
+        .enum(["rc", "steel", "wood"])
+        .optional()
+        .describe("建物構造（省略時は用途地域から自動推奨）"),
+    }),
+    execute: async ({
+      lat,
+      lon,
+      siteArea,
+      structure,
+    }: {
+      lat: number;
+      lon: number;
+      siteArea: number;
+      structure?: BuildingStructure;
+    }) => {
+      // 1. 用途地域(API 6)と地価公示(API 1)を並列取得
+      const [zoningResult, landPriceResult] = await Promise.all([
+        fetchGeospatialData(6, lat, lon),
+        fetchGeospatialData(1, lat, lon),
+      ]);
+
+      // 2. 用途地域データから容積率・建蔽率を抽出
+      let floorAreaRatio = 200;
+      let buildingCoverageRatio = 60;
+      let zoneName = "不明";
+
+      if (zoningResult.features.length > 0) {
+        const zoning = parseZoningData(
+          zoningResult.features[0].properties,
+        );
+        if (zoning) {
+          floorAreaRatio = zoning.floorAreaRatio;
+          buildingCoverageRatio = zoning.buildingCoverageRatio;
+          zoneName = zoning.zoneName;
+        }
+      }
+
+      // 3. 構造が未指定なら用途地域から推奨
+      const resolvedStructure = structure ?? suggestStructure(floorAreaRatio);
+
+      // 4. 建築規模を算出
+      const building = calculateBuilding({
+        siteArea,
+        floorAreaRatio,
+        buildingCoverageRatio,
+        structure: resolvedStructure,
+      });
+
+      // 5. 逆ジオコードで都道府県コードを取得
+      const addressInfo = await reverseGeocode(lat, lon);
+      const prefCode = addressInfo?.prefCode ?? "";
+      const address = addressInfo?.address ?? "住所不明";
+
+      // 6. 地価公示データから㎡単価を抽出
+      let landPricePerSqm = 0;
+      if (landPriceResult.features.length > 0) {
+        for (const feature of landPriceResult.features) {
+          const props = feature.properties;
+          const currentYearPrice = Number(
+            props["u_current_years_price_ja"],
+          );
+          if (Number.isFinite(currentYearPrice) && currentYearPrice > 0) {
+            landPricePerSqm = currentYearPrice;
+            break;
+          }
+          const lastYearPrice = Number(props["last_years_price"]);
+          if (Number.isFinite(lastYearPrice) && lastYearPrice > 0) {
+            landPricePerSqm = lastYearPrice;
+            break;
+          }
+        }
+      }
+
+      // 地価が取得できなかった場合はエリアベンチマークで代用
+      if (landPricePerSqm === 0) {
+        const benchmark = getAreaBenchmark(prefCode);
+        // ベンチマーク賃料から還元利回りで逆算: 地価 = 賃料(年) / capRate
+        landPricePerSqm = (benchmark.rentPerSqm * 12) / benchmark.capRate;
+      }
+
+      const landPrice = landPricePerSqm * siteArea;
+
+      // 7. 賃料推定
+      const rentResult = estimateRent({
+        lat,
+        lon,
+        totalFloorArea: building.totalFloorArea,
+        structure: resolvedStructure,
+        prefCode,
+        landPricePerSqm,
+      });
+
+      // 8. 収益計算
+      const revenue = calculateRevenue({
+        annualRent: rentResult.annualRent,
+        constructionCost: building.constructionCost,
+        landPrice,
+        totalFloorArea: building.totalFloorArea,
+      });
+
+      const totalInvestment = building.constructionCost + landPrice;
+
+      // 9. 結果を構造化して返す
+      return {
+        address,
+        zoning: {
+          name: zoneName,
+          floorAreaRatio,
+          buildingCoverageRatio,
+        },
+        building: {
+          structure: building.structureName,
+          totalFloorArea: building.totalFloorArea,
+          floors: building.estimatedFloors,
+          constructionCost: building.constructionCost,
+        },
+        rent: {
+          monthlyRent: rentResult.monthlyRent,
+          annualRent: rentResult.annualRent,
+          method: rentResult.method,
+          confidence: rentResult.confidence,
+        },
+        revenue: {
+          grossYield: revenue.grossYield,
+          netYield: revenue.netYield,
+          noi: revenue.noi,
+          cashFlow: revenue.cashFlow,
+          dcr: revenue.dcr,
+          irr5y: revenue.irr5y,
+          irr10y: revenue.irr10y,
+        },
+        landPrice,
+        totalInvestment,
+        disclaimer:
+          "本シミュレーションは国土交通省データに基づく概算であり、実際の収益を保証するものではありません。投資判断は専門家にご相談ください。",
       };
     },
   }),
