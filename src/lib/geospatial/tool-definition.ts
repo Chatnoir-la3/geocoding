@@ -13,6 +13,7 @@ import {
 import { estimateRent } from "@/lib/simulation/rent-estimator";
 import { calculateRevenue } from "@/lib/simulation/revenue-calculator";
 import { getAreaBenchmark } from "@/lib/simulation/area-benchmarks";
+import { diagnoseLandUse } from "@/lib/simulation/land-use-diagnosis";
 import type { BuildingStructure } from "@/types/simulation";
 
 const apiListDescription = getAllApiConfigs()
@@ -230,6 +231,90 @@ ${apiListDescription}
         totalInvestment,
         disclaimer:
           "本シミュレーションは国土交通省データに基づく概算であり、実際の収益を保証するものではありません。投資判断は専門家にご相談ください。",
+      };
+    },
+  }),
+
+  diagnose_land_use: tool({
+    description: `土地活用の最適方法を診断します。売却・アパート建築・月極駐車場・コインパーキングの4パターンを利回り・10年リターンで比較し、最適な活用方法を提案します。
+遊休地の活用相談や「この土地をどうすべきか」という質問に使用してください。`,
+    inputSchema: z.object({
+      lat: z.number().describe("緯度"),
+      lon: z.number().describe("経度"),
+      siteArea: z.number().describe("敷地面積（㎡）"),
+    }),
+    execute: async ({
+      lat,
+      lon,
+      siteArea,
+    }: {
+      lat: number;
+      lon: number;
+      siteArea: number;
+    }) => {
+      // 用途地域(API 6)と地価公示(API 1)を並列取得
+      const [zoningResult, landPriceResult] = await Promise.all([
+        fetchGeospatialData(6, lat, lon),
+        fetchGeospatialData(1, lat, lon),
+      ]);
+
+      let floorAreaRatio = 200;
+      let buildingCoverageRatio = 60;
+
+      if (zoningResult.features.length > 0) {
+        const zoning = parseZoningData(zoningResult.features[0].properties);
+        if (zoning) {
+          floorAreaRatio = zoning.floorAreaRatio;
+          buildingCoverageRatio = zoning.buildingCoverageRatio;
+        }
+      }
+
+      // 逆ジオコードで都道府県コード取得
+      const addressInfo = await reverseGeocode(lat, lon);
+      const prefCode = addressInfo?.prefCode ?? "";
+
+      // 地価㎡単価を抽出
+      let landPricePerSqm = 0;
+      if (landPriceResult.features.length > 0) {
+        for (const feature of landPriceResult.features) {
+          const props = feature.properties;
+          const price = Number(props["u_current_years_price_ja"]) || Number(props["last_years_price"]);
+          if (Number.isFinite(price) && price > 0) {
+            landPricePerSqm = price;
+            break;
+          }
+        }
+      }
+      if (landPricePerSqm === 0) {
+        const benchmark = getAreaBenchmark(prefCode);
+        landPricePerSqm = (benchmark.rentPerSqm * 12) / benchmark.capRate;
+      }
+
+      const diagnosis = diagnoseLandUse({
+        siteArea,
+        landPricePerSqm,
+        prefCode,
+        floorAreaRatio,
+        buildingCoverageRatio,
+      });
+
+      return {
+        address: addressInfo?.address ?? "住所不明",
+        siteArea,
+        landPricePerSqm,
+        options: diagnosis.options.map((o) => ({
+          type: o.type,
+          label: o.label,
+          initialCost: o.initialCost,
+          annualIncome: o.annualIncome,
+          noi: o.noi,
+          yield: o.yield,
+          totalReturn10y: o.totalReturn10y,
+        })),
+        recommendation: diagnosis.recommendation,
+        reportUrl: `/api/report?lat=${lat}&lon=${lon}&siteArea=${siteArea}`,
+        disclaimer:
+          "本診断は概算であり、実際の収益を保証するものではありません。",
       };
     },
   }),
