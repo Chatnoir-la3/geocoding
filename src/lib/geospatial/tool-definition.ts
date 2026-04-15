@@ -6,15 +6,29 @@ import { buildMapUrl } from "./map-url";
 import { getAllApiConfigs } from "./api-registry";
 import { isMockModeEnabled } from "@/lib/mock/mock-responses";
 import {
-  calculateBuilding,
+  calculateBuildingWithRegulations,
   suggestStructure,
   parseZoningData,
 } from "@/lib/simulation/building-calc";
+import type { FirePreventionZone } from "@/lib/simulation/building-calc";
 import { estimateRent } from "@/lib/simulation/rent-estimator";
 import { calculateRevenue } from "@/lib/simulation/revenue-calculator";
 import { getAreaBenchmark } from "@/lib/simulation/area-benchmarks";
 import { diagnoseLandUse } from "@/lib/simulation/land-use-diagnosis";
 import type { BuildingStructure } from "@/types/simulation";
+import type { GeoJsonFeature } from "@/types/geospatial";
+
+/**
+ * API 7（防火・準防火地域）のレスポンスから防火区分を判定する。
+ */
+function parseFireZone(features: GeoJsonFeature[]): FirePreventionZone {
+  if (features.length === 0) return null;
+  const props = features[0].properties;
+  const values = Object.values(props).map(String).join(" ");
+  if (values.includes("防火地域") && !values.includes("準防火")) return "fire";
+  if (values.includes("準防火")) return "quasi-fire";
+  return null;
+}
 
 const apiListDescription = getAllApiConfigs()
   .map((api) => `${api.id}: ${api.name} - ${api.description}`)
@@ -111,10 +125,13 @@ ${apiListDescription}
       siteArea: number;
       structure?: BuildingStructure;
     }) => {
-      // 1. 用途地域(API 6)と地価公示(API 1)を並列取得
-      const [zoningResult, landPriceResult] = await Promise.all([
+      // 1. 用途地域(API 6)、地価公示(API 1)、防火地域(API 7)、地区計画(API 9)、高度利用地区(API 10)を並列取得
+      const [zoningResult, landPriceResult, fireZoneResult, districtPlanResult, heightDistrictResult] = await Promise.all([
         fetchGeospatialData(6, lat, lon),
         fetchGeospatialData(1, lat, lon),
+        fetchGeospatialData(7, lat, lon),
+        fetchGeospatialData(9, lat, lon),
+        fetchGeospatialData(10, lat, lon),
       ]);
 
       // 2. 用途地域データから容積率・建蔽率を抽出
@@ -133,23 +150,28 @@ ${apiListDescription}
         }
       }
 
-      // 3. 構造が未指定なら用途地域から推奨
+      // 3. 防火地域の判定
+      const fireZone = parseFireZone(fireZoneResult.features);
+
+      // 4. 構造が未指定なら用途地域から推奨
       const resolvedStructure = structure ?? suggestStructure(floorAreaRatio);
 
-      // 4. 建築規模を算出
-      const building = calculateBuilding({
+      // 5. 建築規模を算出（法規制反映）
+      const building = calculateBuildingWithRegulations({
         siteArea,
         floorAreaRatio,
         buildingCoverageRatio,
         structure: resolvedStructure,
+        zoneName,
+        firePreventionZone: fireZone,
       });
 
-      // 5. 逆ジオコードで都道府県コードを取得
+      // 6. 逆ジオコードで都道府県コードを取得
       const addressInfo = await reverseGeocode(lat, lon);
       const prefCode = addressInfo?.prefCode ?? "";
       const address = addressInfo?.address ?? "住所不明";
 
-      // 6. 地価公示データから㎡単価を抽出
+      // 7. 地価公示データから㎡単価を抽出
       let landPricePerSqm = 0;
       if (landPriceResult.features.length > 0) {
         for (const feature of landPriceResult.features) {
@@ -178,7 +200,7 @@ ${apiListDescription}
 
       const landPrice = landPricePerSqm * siteArea;
 
-      // 7. 賃料推定
+      // 8. 賃料推定
       const rentResult = estimateRent({
         lat,
         lon,
@@ -188,7 +210,7 @@ ${apiListDescription}
         landPricePerSqm,
       });
 
-      // 8. 収益計算
+      // 9. 収益計算
       const revenue = calculateRevenue({
         annualRent: rentResult.annualRent,
         constructionCost: building.constructionCost,
@@ -198,7 +220,7 @@ ${apiListDescription}
 
       const totalInvestment = building.constructionCost + landPrice;
 
-      // 9. 結果を構造化して返す
+      // 10. 結果を構造化して返す
       return {
         address,
         zoning: {
@@ -227,6 +249,14 @@ ${apiListDescription}
           irr5y: revenue.irr5y,
           irr10y: revenue.irr10y,
         },
+        regulations: {
+          firePreventionZone: fireZone,
+          districtPlan: districtPlanResult.featureCount > 0,
+          heightDistrict: heightDistrictResult.featureCount > 0,
+          consumptionRate: building.consumptionRate,
+          heightLimited: building.heightLimited,
+          structureOverridden: building.structureOverridden,
+        },
         landPrice,
         totalInvestment,
         disclaimer:
@@ -252,10 +282,11 @@ ${apiListDescription}
       lon: number;
       siteArea: number;
     }) => {
-      // 用途地域(API 6)と地価公示(API 1)を並列取得
-      const [zoningResult, landPriceResult] = await Promise.all([
+      // 用途地域(API 6)、地価公示(API 1)、防火地域(API 7)を並列取得
+      const [zoningResult, landPriceResult, fireZoneResult] = await Promise.all([
         fetchGeospatialData(6, lat, lon),
         fetchGeospatialData(1, lat, lon),
+        fetchGeospatialData(7, lat, lon),
       ]);
 
       let floorAreaRatio = 200;
@@ -268,6 +299,9 @@ ${apiListDescription}
           buildingCoverageRatio = zoning.buildingCoverageRatio;
         }
       }
+
+      // 防火地域の判定
+      const fireZone = parseFireZone(fireZoneResult.features);
 
       // 逆ジオコードで都道府県コード取得
       const addressInfo = await reverseGeocode(lat, lon);
@@ -311,6 +345,9 @@ ${apiListDescription}
           yield: o.yield,
           totalReturn10y: o.totalReturn10y,
         })),
+        regulations: {
+          firePreventionZone: fireZone,
+        },
         recommendation: diagnosis.recommendation,
         reportUrl: `/api/report?lat=${lat}&lon=${lon}&siteArea=${siteArea}`,
         disclaimer:

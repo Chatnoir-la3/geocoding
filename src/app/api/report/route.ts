@@ -1,7 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
 import { fetchGeospatialData, fetchMultipleApis } from "@/lib/geospatial/api-client";
 import { reverseGeocode } from "@/lib/geospatial/geocoder";
-import { parseZoningData, calculateBuilding, suggestStructure } from "@/lib/simulation/building-calc";
+import { parseZoningData, calculateBuildingWithRegulations, suggestStructure } from "@/lib/simulation/building-calc";
+import type { FirePreventionZone } from "@/lib/simulation/building-calc";
 import { estimateRent } from "@/lib/simulation/rent-estimator";
 import { calculateRevenue } from "@/lib/simulation/revenue-calculator";
 import { calculateRiskScore } from "@/lib/simulation/risk-scorer";
@@ -11,6 +12,18 @@ import type { GeoJsonFeature } from "@/types/geospatial";
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/**
+ * API 7（防火・準防火地域）のレスポンスから防火区分を判定する。
+ */
+function parseFireZone(features: GeoJsonFeature[]): FirePreventionZone {
+  if (features.length === 0) return null;
+  const props = features[0].properties;
+  const values = Object.values(props).map(String).join(" ");
+  if (values.includes("防火地域") && !values.includes("準防火")) return "fire";
+  if (values.includes("準防火")) return "quasi-fire";
+  return null;
+}
 
 /**
  * Extract land price per sqm from API 1 (地価公示) features.
@@ -59,10 +72,13 @@ export async function GET(request: NextRequest) {
   }
 
   try {
-    // --- Step 1: Fetch zoning (API 6) and land price (API 1) in parallel ---
-    const [zoningResult, landPriceResult] = await Promise.all([
+    // --- Step 1: Fetch zoning (API 6), land price (API 1), fire zone (API 7), district plan (API 9), height district (API 10) in parallel ---
+    const [zoningResult, landPriceResult, fireZoneResult, districtPlanResult, heightDistrictResult] = await Promise.all([
       fetchGeospatialData(6, lat, lon),
       fetchGeospatialData(1, lat, lon),
+      fetchGeospatialData(7, lat, lon),
+      fetchGeospatialData(9, lat, lon),
+      fetchGeospatialData(10, lat, lon),
     ]);
 
     // --- Step 2: Parse zoning data ---
@@ -79,13 +95,16 @@ export async function GET(request: NextRequest) {
       );
     }
 
-    // --- Step 3: Calculate building ---
+    // --- Step 3: Calculate building (with regulations) ---
     const structure = suggestStructure(zoningData.floorAreaRatio);
-    const buildingResult = calculateBuilding({
+    const fireZone = parseFireZone(fireZoneResult.features);
+    const buildingResult = calculateBuildingWithRegulations({
       siteArea,
       floorAreaRatio: zoningData.floorAreaRatio,
       buildingCoverageRatio: zoningData.buildingCoverageRatio,
       structure,
+      zoneName: zoningData.zoneName,
+      firePreventionZone: fireZone,
     });
 
     // --- Step 4: Reverse geocode for address and prefCode ---
@@ -126,7 +145,17 @@ export async function GET(request: NextRequest) {
 
     const riskScore = calculateRiskScore(hazardFeatures);
 
-    // --- Step 9: Generate HTML report ---
+    // --- Step 9: Build regulations data ---
+    const regulations = {
+      firePreventionZone: fireZone,
+      districtPlan: districtPlanResult.featureCount > 0,
+      heightDistrict: heightDistrictResult.featureCount > 0,
+      consumptionRate: buildingResult.consumptionRate,
+      heightLimited: buildingResult.heightLimited,
+      structureOverridden: buildingResult.structureOverridden,
+    };
+
+    // --- Step 10: Generate HTML report ---
     const totalInvestment = buildingResult.constructionCost + landPrice;
     const html = generateReportHtml({
       address,
@@ -165,12 +194,13 @@ export async function GET(request: NextRequest) {
         factors: riskScore.factors,
         financingNote: riskScore.financingNote,
       },
+      regulations,
       landPrice,
       totalInvestment,
       generatedAt: new Date().toISOString().split("T")[0],
-    });
+    } as Parameters<typeof generateReportHtml>[0]);
 
-    // --- Step 10: Return HTML ---
+    // --- Step 11: Return HTML ---
     return new NextResponse(html, {
       status: 200,
       headers: {
