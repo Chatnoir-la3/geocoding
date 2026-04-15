@@ -4,6 +4,82 @@ import type {
   BuildingResult,
 } from "@/types/simulation";
 
+// ---------------------------------------------------------------------------
+// 用途地域別 容積消化率テーブル
+// 斜線制限・日影規制により容積率を100%使い切れないケースを補正する
+// ---------------------------------------------------------------------------
+
+const FLOOR_AREA_CONSUMPTION_RATE: Record<string, number> = {
+  "第一種低層住居専用地域": 0.90,
+  "第二種低層住居専用地域": 0.90,
+  "田園住居地域": 0.90,
+  "第一種中高層住居専用地域": 0.75,
+  "第二種中高層住居専用地域": 0.80,
+  "第一種住居地域": 0.85,
+  "第二種住居地域": 0.85,
+  "準住居地域": 0.85,
+  "近隣商業地域": 0.90,
+  "商業地域": 0.95,
+  "準工業地域": 0.90,
+  "工業地域": 0.90,
+  "工業専用地域": 0.90,
+};
+
+/** テーブルキーが zoneName に含まれるかで部分一致検索。一致なしのデフォルトは 0.85 */
+function getConsumptionRate(zoneName: string): number {
+  for (const [key, rate] of Object.entries(FLOOR_AREA_CONSUMPTION_RATE)) {
+    if (zoneName.includes(key)) return rate;
+  }
+  return 0.85;
+}
+
+// ---------------------------------------------------------------------------
+// 低層住居地域の絶対高さ制限
+// ---------------------------------------------------------------------------
+
+const LOW_RISE_ZONES = [
+  "第一種低層住居専用地域",
+  "第二種低層住居専用地域",
+  "田園住居地域",
+];
+const LOW_RISE_HEIGHT_LIMIT = 10; // メートル
+const FLOOR_HEIGHT = 3; // 1階あたりの高さ（メートル）
+
+// ---------------------------------------------------------------------------
+// 防火地域による構造制限
+// ---------------------------------------------------------------------------
+
+export type FirePreventionZone = "fire" | "quasi-fire" | null;
+
+/**
+ * 防火地域の制約に基づき建物構造を補正する。
+ * - 防火地域("fire") → 木造不可。wood は "rc" に変更
+ * - 準防火地域("quasi-fire") → 木造は3階以下のみ。4階以上なら "steel" に変更
+ * - null → 制約なし
+ */
+function applyFireZoneConstraint(
+  structure: BuildingStructure,
+  fireZone: FirePreventionZone,
+  floors: number,
+): BuildingStructure {
+  if (fireZone === "fire" && structure === "wood") {
+    return "rc";
+  }
+  if (fireZone === "quasi-fire" && structure === "wood" && floors >= 4) {
+    return "steel";
+  }
+  return structure;
+}
+
+// ---------------------------------------------------------------------------
+// 建築規制を含む拡張パラメータ型
+// ---------------------------------------------------------------------------
+
+interface BuildingCalcParams extends BuildingParams {
+  zoneName?: string;
+  firePreventionZone?: FirePreventionZone;
+}
+
 /** 構造別㎡単価（円）— 坪単価 ÷ 3.306 で換算 */
 const COST_PER_SQM: Record<BuildingStructure, number> = {
   rc: 272_000, // RC造: 坪90万円
@@ -94,4 +170,85 @@ function parseNumericPercent(value: string): number | null {
   if (!match) return null;
   const num = Number(match[1]);
   return Number.isFinite(num) ? num : null;
+}
+
+// ---------------------------------------------------------------------------
+// 建築規制を加味した拡張シミュレーション
+// ---------------------------------------------------------------------------
+
+/**
+ * 用途地域別容積消化率・高さ制限・防火地域制約を反映して建築規模を算出する。
+ *
+ * 処理フロー:
+ * 1. 防火地域制約で構造を補正
+ * 2. 用途地域から容積消化率を取得
+ * 3. 容積率 × 消化率 で延床面積を再計算
+ * 4. 低層住居地域の場合、高さ制限で階数を制約
+ * 5. 階数制約時は延床面積 = 建築面積 × 制約後階数 に再計算
+ * 6. 建築費を再計算
+ */
+export function calculateBuildingWithRegulations(
+  params: BuildingCalcParams,
+): BuildingResult & {
+  consumptionRate: number;
+  heightLimited: boolean;
+  structureOverridden: boolean;
+} {
+  const {
+    siteArea,
+    floorAreaRatio,
+    buildingCoverageRatio,
+    structure,
+    zoneName,
+    firePreventionZone,
+  } = params;
+
+  const buildingArea = siteArea * (buildingCoverageRatio / 100);
+
+  // 1. 容積消化率を取得・適用
+  const consumptionRate = zoneName ? getConsumptionRate(zoneName) : 0.85;
+  let totalFloorArea = siteArea * (floorAreaRatio / 100) * consumptionRate;
+
+  // 2. 仮の階数を算出
+  let estimatedFloors = Math.ceil(totalFloorArea / buildingArea);
+
+  // 3. 低層住居地域の高さ制限チェック
+  let heightLimited = false;
+  if (zoneName) {
+    const isLowRise = LOW_RISE_ZONES.some((z) => zoneName.includes(z));
+    if (isLowRise) {
+      const maxFloors = Math.floor(LOW_RISE_HEIGHT_LIMIT / FLOOR_HEIGHT);
+      if (estimatedFloors > maxFloors) {
+        estimatedFloors = maxFloors;
+        totalFloorArea = buildingArea * estimatedFloors;
+        heightLimited = true;
+      }
+    }
+  }
+
+  // 4. 防火地域制約で構造を補正
+  let effectiveStructure = structure;
+  let structureOverridden = false;
+  if (firePreventionZone) {
+    effectiveStructure = applyFireZoneConstraint(
+      structure,
+      firePreventionZone,
+      estimatedFloors,
+    );
+    structureOverridden = effectiveStructure !== structure;
+  }
+
+  // 5. 建築費を算出
+  const constructionCost = totalFloorArea * COST_PER_SQM[effectiveStructure];
+
+  return {
+    buildingArea,
+    totalFloorArea,
+    estimatedFloors,
+    constructionCost,
+    structureName: STRUCTURE_NAME[effectiveStructure],
+    consumptionRate,
+    heightLimited,
+    structureOverridden,
+  };
 }
